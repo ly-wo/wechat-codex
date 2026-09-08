@@ -32,10 +32,11 @@ export function createSessionStore() {
     return join(SESSIONS_DIR, `${accountId}.json`);
   }
 
-  function load(accountId: string): Session {
+  function load(accountId: string, defaults?: { workingDirectory: string; model?: string }): Session {
     validateAccountId(accountId);
     const session = loadJson<Session>(getSessionPath(accountId), {
-      workingDirectory: DEFAULT_WORKING_DIR,
+      workingDirectory: defaults?.workingDirectory ?? DEFAULT_WORKING_DIR,
+      model: defaults?.model,
       state: 'idle',
       chatHistory: [],
       maxHistoryLength: DEFAULT_MAX_HISTORY,
@@ -106,7 +107,7 @@ export function createSessionStore() {
     const lines: string[] = [];
     for (const msg of messages) {
       const time = new Date(msg.timestamp).toLocaleString('zh-CN');
-      const role = msg.role === 'user' ? '用户' : 'Claude';
+      const role = msg.role === 'user' ? '用户' : 'Codex';
       lines.push(`[${time}] ${role}:`);
       lines.push(msg.content);
       lines.push('');

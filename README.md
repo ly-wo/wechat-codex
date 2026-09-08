@@ -1,133 +1,123 @@
-# WeChat Claude Code Bridge
+# WeChat Codex Bridge
 
-<p align="center">
-  <strong>Chat with Claude Code in WeChat, just like texting a friend</strong>
-</p>
+在微信里向本机 Codex 发任务、接收进度与结果，支持文字、图片、文件、会话续接和微信命令。
 
-<p align="center">
-  <a href="https://github.com/Wechat-ggGitHub/wechat-claude-code/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License: MIT"></a>
-  <a href="https://skills.sh/Wechat-ggGitHub/wechat-claude-code"><img src="https://img.shields.io/badge/skills.sh-view_page-blue?style=flat-square" alt="skills.sh"></a>
-  <a href="README_en.md"><img src="https://img.shields.io/badge/Lang-English-lightgrey?style=flat-square" alt="English"></a>
-</p>
-
-扫码绑定微信后，你的微信里会多出一个好友。给它发消息，消息会自动转发给你电脑上运行的 Claude Code，回复也会实时推送到微信。支持文字、图片、语音、文件的收发。
-
-<img width="3018" height="1216" alt="ScreenShot_2026-06-10_211251_410" src="https://github.com/user-attachments/assets/2ba4c53b-9c63-4ffd-bd0a-71935a6eabec" />
-
-## 核心亮点
-| | |
-|---|---|
-| **扫码即用** | 不用注册账号，不用部署服务器。微信扫码绑定，一分钟搞定。数据全在本地，隐私有保障。 |
-| **消息不刷屏** | 只推送核心信息——进度、结果、关键决策。工具调用、中间过程等噪音自动过滤，阅读体验清爽。 |
-| **"对方正在输入中..."** | Claude 在处理任务时，微信顶部会显示输入状态，随时感知它在干活。 |
-| **电脑手机体验一致** | 手机端和电脑端 Claude Code 行为完全相同——同样的编排逻辑、同样的输出效果。不是两个割裂的 AI。 |
-| **文件双向收发** | 发图片、Word、PDF 给 Claude 分析；Claude 生成的文件也会直接推送到微信，不用回到电脑前查看。 |
-| **超时安抚** | 任务超过 5 分钟没响应？它会自动发一条消息告诉你还在干，不会让你对着空白聊天框干等。 |
-
-## 快速安装
-
-**方式一：skills CLI（推荐）**
-
-```bash
-npx skills add Wechat-ggGitHub/wechat-claude-code
-```
-
-首次在对话中触发时，会自动克隆项目源码并安装依赖。
-
-**方式二：手动克隆**
-
-```bash
-git clone https://github.com/Wechat-ggGitHub/wechat-claude-code.git ~/.claude/skills/wechat-claude-code
-cd ~/.claude/skills/wechat-claude-code && npm install
-```
+基于 [Wechat-ggGitHub/wechat-claude-code](https://github.com/Wechat-ggGitHub/wechat-claude-code) 的 `5014307` 改造，保留 MIT 许可证与上游历史。本仓库为 Codex 适配版，未发布 npm 包。[English](README_en.md)
 
 ## 快速开始
 
-### 1. 扫码绑定
+需要 macOS 或 Linux、Node.js >= 18、个人微信账号，以及安装并登录的 Codex CLI。已使用 `codex-cli 0.153.4` 完成真实模型调用及会话续接验证。
 
-```bash
-cd ~/.claude/skills/wechat-claude-code
-npm run setup
+```sh
+npm install -g @openai/codex
+codex login
 ```
 
-弹出二维码，用微信扫码。
+首次下载项目：
 
-### 2. 启动服务
+```sh
+git clone https://github.com/ly-wo/wechat-codex.git
+cd wechat-codex
+```
 
-```bash
+在本项目目录运行（已经安装依赖时跳过 `npm install`）：
+
+```sh
+npm install
+npm run setup
 npm run daemon -- start
 ```
 
-macOS 下自动注册 launchd，开机自启、崩溃自动重启。
+`setup` 显示微信二维码，扫码后选择 Codex 工作目录。后台服务在 macOS 使用 launchd，Linux 优先使用 systemd 用户服务，无可用用户服务时使用后台进程。前台运行可用 `npm run run`。
 
-### 3. 开始聊天
-
-打开微信，给你新出现的那个"好友"发条消息试试。
-
-### 管理服务
-
-```bash
-npm run daemon -- status   # 查看运行状态
-npm run daemon -- stop     # 停止服务
-npm run daemon -- restart  # 重启服务（更新代码后使用）
-npm run daemon -- logs     # 查看日志
+```sh
+npm run daemon -- status
+npm run daemon -- stop
+npm run daemon -- restart
+npm run daemon -- logs
 ```
 
-## 微信端命令
+电脑需要保持开机、联网且未休眠。服务只处理扫码绑定用户的消息；账号缺少绑定用户信息时会拒绝启动，请重新 setup。
 
-直接在微信聊天中发送即可：
+## 微信命令
 
-| 命令 | 说明 |
-|------|------|
-| `/help` | 显示帮助 |
-| `/clear` | 清除当前会话，开始新对话 |
-| `/stop` | 停止当前任务 |
-| `/model <名称>` | 切换 Claude 模型 |
-| `/prompt <内容>` | 设置系统提示词（如"用中文回答"） |
-| `/cwd <路径>` | 切换工作目录 |
-| `/skills` | 查看已安装的 Skill |
-| `/status` | 查看当前会话状态 |
-| `/history [数量]` | 查看最近对话记录 |
-| `/compact` | 压缩上下文，开始新 CLI 会话 |
-| `/reset` | 完全重置（包括工作目录等设置） |
-| `/undo [数量]` | 撤销最近几条对话 |
-| `/<skill> [参数]` | 触发任意已安装的 Skill |
+| 命令 | 行为 |
+| --- | --- |
+| `/help` | 查看帮助 |
+| `/stop` | 取消当前 Codex 任务并清空排队消息 |
+| `/clear` | 取消当前任务、清空排队消息与聊天记录，下一条消息新建会话；保留工作目录和模型 |
+| `/cwd [路径]` | 查看或切换到已存在的目录；切换后新建会话 |
+| `/model [名称]` | 查看或指定模型；`/model default` 恢复全局配置或 Codex 默认模型 |
+| `/prompt [内容]` | 查看或设置全局补充指令；`/prompt clear` 清除；下一次任务生效 |
+| `/skills [full]` | 查看项目、用户和本机插件缓存中的 Skill；full 显示描述 |
+| `/<skill> [参数]` | 把对应 Skill 的路径和用户请求交给 Codex |
+| `/status` | 查看目录、模型、会话 ID 和状态 |
+| `/history [数量]` | 查看本地保存的聊天记录 |
+| `/compact` | 下一次使用新上下文，只保留本地聊天记录；不执行 Codex 原生摘要压缩 |
+| `/undo [数量]` | 删除本地聊天记录；不会撤销代码修改或 Codex 的内部上下文 |
+| `/reset` | 重置会话，恢复全局工作目录和模型 |
+| `/send <路径>` | 把本机文件发送到微信 |
+| `/version` | 查看版本 |
 
-## 工作原理
+文本回复按 Codex 完整消息事件推送，过滤推理和原始工具输出；不是逐字刷新。语音依赖微信消息附带的转写文本，暂不额外做语音识别。接收到的文件保存为临时文件，由 Codex 按路径读取。回复中识别出的常见文档、图片等文件会自动推送，也可使用 `/send`。
 
+## 配置与权限
+
+默认数据目录 `~/.wechat-codex/`，含 `accounts/`、`config.json`、`sessions/`、`logs/` 和轮询状态。可通过 `WECHAT_CODEX_DATA_DIR` 指定绝对路径；兼容原项目的 `WCC_DATA_DIR` 变量。Codex 版本不会自动导入 Claude 会话。
+
+`config.json` 示例：
+
+```json
+{
+  "workingDirectory": "/absolute/path/to/project",
+  "sandbox": "workspace-write",
+  "timeoutMs": 3600000,
+  "systemPrompt": "请用中文回答"
+}
 ```
-微信（手机） ←→ ilink Bot API ←→ Node.js 守护进程 ←→ Claude Code CLI（本地）
+
+| 字段 | 默认值 / 用途 |
+| --- | --- |
+| `workingDirectory` | `~/Documents/Codex`；首次 setup 可指定 |
+| `model` | 可选；不填写时沿用本机 Codex 模型配置 |
+| `codexPath` | 可选；Codex 可执行文件路径。否则使用 `CODEX_BIN` 或 PATH 中的 `codex` |
+| `sandbox` | `workspace-write`，允许在工作区内编辑；可改为 `read-only` |
+| `timeoutMs` | 单次任务默认 60 分钟，超时会停止进程并报告未完成 |
+| `systemPrompt` | 可选；作为本次 Codex 的 `developer_instructions` 补充指令 |
+
+桥接使用非交互模式，审批策略为 `never`，需要额外审批的操作会失败。此版本提供 `read-only` 和 `workspace-write` 两种权限，不启用跳过沙箱的启动参数。绑定用户可以通过微信修改工作区、读取文件和执行任务，应使用自己控制的微信账号。
+
+使用同一个本机账号的 Codex 登录状态及配置（`CODEX_HOME` 也可指定）。后台安装会记录 Codex 路径及已设置的相关环境变量；修改这些变量后重新启动服务。服务配置文件权限为仅当前用户读写。不要在微信消息或日志里粘贴 API 密钥。
+
+### 模型提示需要新版 Codex
+
+如果日志出现 `requires a newer version of Codex`，应更新桥接实际调用的 Codex。仅更新桌面应用不一定会更新 PATH 中的独立 CLI。可在 `config.json` 设置 `codexPath` 指向已验证的新版可执行文件，例如 macOS 本机安装的 `/Applications/ChatGPT.app/Contents/Resources/codex`，然后重启桥接。启动日志 `Codex runtime ready` 会显示实际路径和版本。清空会话不能解决版本不兼容。
+
+## 安装为 Codex Skill（可选）
+
+把完整项目保存在固定目录，将该目录链接到用户 Skill 目录。例如，本项目位于 `~/Documents/Projects/wechat-codex`：
+
+```sh
+mkdir -p ~/.agents/skills
+ln -s "$HOME/Documents/Projects/wechat-codex" "$HOME/.agents/skills/wechat-codex"
 ```
 
-守护进程通过长轮询监听微信消息，转发给本地 `claude` CLI 处理，回复实时流式推送回微信。全程跑在你自己电脑上。
+如果已有同名目录，先检查它，不要直接覆盖。重新进入 Codex 后可用 `$wechat-codex` 或“启动微信桥接”。本仓库的 `SKILL.md` 使用自身所在目录运行，不会下载上游 Claude 版本覆盖本项目。
 
-## 后续计划
+## 验证与实现
 
-- **消息队列优化** — 连续发多条指令时，回复容易串。正在研究更好的队列策略，也欢迎讨论。
-- **电脑休眠不中断** — 利用 macOS 的 `caffeinate` 命令阻止系统睡眠，合上盖子也能响应微信消息。
-- **接续电脑会话** — 在电脑上聊了很久，出门想接着聊。计划支持从当前电脑端的 Claude Code 会话直接续聊，工作空间和上下文保持一致。
-
-## 前置条件
-
-- Node.js >= 18
-- macOS 或 Linux
-- 个人微信账号
-- 已安装 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 并完成认证
-
-> **提示：** Claude Code 支持第三方 API 提供商（OpenRouter、AWS Bedrock 等），设置 `ANTHROPIC_BASE_URL` 和 `ANTHROPIC_API_KEY` 即可。
-
-## 数据目录
-
-所有数据存储在 `~/.wechat-claude-code/`：
-
+```sh
+npm run check
 ```
-~/.wechat-claude-code/
-├── accounts/       # 微信账号凭证
-├── config.json     # 全局配置
-├── sessions/       # 会话数据
-└── logs/           # 运行日志（每日轮转，保留 30 天）
-```
+
+验证会构建 TypeScript 并运行本地测试，包含实际模拟子进程的 JSONL 分帧、stdin、图片生命周期、会话续接、取消、超时、错误状态，以及配置和 Skill 发现。测试使用临时数据目录，不连接微信或模型服务。
+
+调用链：微信 iLink API → Node.js 消息队列 → `codex exec --json` / `codex exec resume` → 微信回复。Codex 会话 ID 保存在桥接数据中，Codex 的完整上下文由 CLI 自身维护。任务失败不会自动换新会话重跑，避免重复执行有副作用的操作。
+
+已在本机用 Codex 0.153.4 实测 `gpt-6-astra` 新建会话和续接返回成功。首次使用仍需完成扫码并发送一条测试消息，确认当前微信收发链路可用。
+
+接入依据：[OpenAI 非交互模式文档](https://learn.chatgpt.com/docs/non-interactive-mode)、[OpenAI Skill 文档](https://learn.chatgpt.com/docs/build-skills)。`docs/superpowers/` 保留上游设计记录，其中的 Claude 说明属于历史资料。
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE)，保留上游作者版权声明。

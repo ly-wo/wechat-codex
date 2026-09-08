@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { filterToolNoise } from '../claude/tool-noise-filter.js';
+import { filterToolNoise } from '../codex/tool-noise-filter.js';
 
 // 测试跑在 dist/tests/，但 fixture JSON 不会被 tsc 复制——直接从 src/ 读。
 const fixturePath = join(process.cwd(), 'src', 'tests', 'fixtures', 'tool-noise', 'real-cases.json');

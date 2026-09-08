@@ -13,12 +13,13 @@ import { createSender } from './wechat/send.js';
 import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, downloadFile } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
-import { claudeQuery, type QueryOptions } from './claude/provider.js';
-import { TurnRouter } from './claude/turn-router.js';
-import { filterToolNoise } from './claude/tool-noise-filter.js';
+import { codexQuery, type QueryOptions } from './codex/provider.js';
+import { formatCodexError } from './codex/errors.js';
+import { TurnRouter } from './codex/turn-router.js';
+import { filterToolNoise } from './codex/tool-noise-filter.js';
 import { loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
-import { DATA_DIR } from './constants.js';
+import { DATA_DIR, DEFAULT_WORKING_DIR } from './constants.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
 import { loadPendingQueue, savePendingQueue, type PendingItem } from './pending-queue.js';
 
@@ -28,7 +29,7 @@ import { loadPendingQueue, savePendingQueue, type PendingItem } from './pending-
 
 const MAX_MESSAGE_LENGTH = 4000;
 
-// Extensions eligible for auto-push when detected in Claude's response
+// Extensions eligible for auto-push when detected in Codex's response
 const AUTO_PUSH_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.ico',
   '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.rtf',
@@ -37,7 +38,7 @@ const AUTO_PUSH_EXTENSIONS = new Set([
   '.mp3', '.wav', '.m4a', '.mp4', '.mov',
 ]);
 
-/** Extract local file paths from Claude's response text. */
+/** Extract local file paths from Codex's response text. */
 function extractFilePathsFromText(text: string, cwd: string): string[] {
   const paths: string[] = [];
   // Match absolute paths (macOS/Linux), tilde paths, and Windows paths with a file extension
@@ -170,6 +171,7 @@ function openFile(filePath: string): void {
 // ---------------------------------------------------------------------------
 
 async function runSetup(): Promise<void> {
+  checkCodex(loadConfig());
   mkdirSync(DATA_DIR, { recursive: true });
   const QR_PATH = join(DATA_DIR, 'qrcode.png');
 
@@ -228,7 +230,7 @@ async function runSetup(): Promise<void> {
     logger.warn('Failed to clean up QR image', { path: QR_PATH });
   }
 
-  const workingDir = await promptUser('请输入工作目录', join(homedir(), 'Documents', 'ClaudeCode'));
+  const workingDir = await promptUser('请输入工作目录', DEFAULT_WORKING_DIR);
   const config = loadConfig();
   config.workingDirectory = workingDir;
   saveConfig(config);
@@ -249,15 +251,11 @@ async function runDaemon(): Promise<void> {
     process.exit(1);
   }
 
+  if (!account.userId) throw new Error('账号缺少绑定用户，请重新运行 npm run setup');
+  checkCodex(config);
   const api = new WeChatApi(account.botToken, account.baseUrl);
   const sessionStore = createSessionStore();
-  const session: Session = sessionStore.load(account.accountId);
-
-  // Fix: backfill session workingDirectory from config if it's still the default process.cwd()
-  if (config.workingDirectory && session.workingDirectory === process.cwd()) {
-    session.workingDirectory = config.workingDirectory;
-    sessionStore.save(account.accountId, session);
-  }
+  const session: Session = sessionStore.load(account.accountId, config);
 
   // Fix: reset stale non-idle state on startup (e.g. after crash)
   if (session.state !== 'idle') {
@@ -277,30 +275,33 @@ async function runDaemon(): Promise<void> {
   async function drainQueue(): Promise<void> {
     if (processingQueue) return;
     processingQueue = true;
-    while (messageQueue.length > 0) {
-      const msg = messageQueue.shift()!;
-      await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue);
-    }
-    processingQueue = false;
+    try {
+      while (messageQueue.length > 0) {
+        const msg = messageQueue.shift()!;
+        try {
+          await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue);
+        } catch (error) {
+          logger.error('Message handling failed', { error: String(error) });
+        }
+      }
+    } finally { processingQueue = false; }
   }
 
   // -- Wire the monitor callbacks --
 
   /** Handle priority commands (/stop, /clear) immediately, bypassing the serial queue. */
   function handlePriorityCommand(msg: WeixinMessage): boolean {
-    if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
-    const text = extractTextFromItems(msg.item_list);
-    if (!text.startsWith('/stop') && !text.startsWith('/clear')) return false;
-    if (session.state !== 'processing') return false;
-
-    const ctrl = activeControllers.get(account!.accountId);
-    if (ctrl) { ctrl.abort(); activeControllers.delete(account!.accountId); }
-    session.state = 'idle';
-    sessionStore.save(account!.accountId, session);
-
-    if (text.startsWith('/stop')) {
-      messageQueue.length = 0;
-      sender.sendText(msg.from_user_id!, msg.context_token ?? '', '⏹ 已停止当前对话，排队中的消息已清空。').catch(() => {});
+    if (msg.message_type !== MessageType.USER || !msg.item_list || msg.from_user_id !== account!.userId) return false;
+    const text = extractTextFromItems(msg.item_list).trim().toLowerCase();
+    if (text !== '/stop' && text !== '/clear') return false;
+    messageQueue.length = 0;
+    activeControllers.get(account!.accountId)?.abort();
+    if (text === '/clear') {
+      // Process clear after the cancelled turn settles, so it cannot restore the old thread ID.
+      messageQueue.unshift(msg);
+      void drainQueue();
+    } else {
+      void sender.sendText(msg.from_user_id!, msg.context_token ?? '', '⏹ 已停止当前对话，排队中的消息已清空。').catch(() => {});
     }
     return true;
   }
@@ -324,7 +325,11 @@ async function runDaemon(): Promise<void> {
   function shutdown(): void {
     logger.info('Shutting down...');
     monitor.stop();
-    process.exit(0);
+    for (const ctrl of activeControllers.values()) ctrl.abort();
+    const deadline = setTimeout(() => process.exit(0), 4_000);
+    const wait = setInterval(() => {
+      if (!activeControllers.size) { clearInterval(wait); clearTimeout(deadline); process.exit(0); }
+    }, 50);
   }
 
   process.on('SIGINT', shutdown);
@@ -386,7 +391,7 @@ async function handleMessage(
       accountId: account.accountId,
       session,
       updateSession,
-      clearSession: () => sessionStore.clear(account.accountId),
+      clearSession: () => sessionStore.clear(account.accountId, session),
       getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
       text: userText,
     };
@@ -398,9 +403,9 @@ async function handleMessage(
       return;
     }
 
-    if (result.handled && result.claudePrompt) {
-      await sendToClaude(
-        result.claudePrompt, imageItem, fileItem, fromUserId, contextToken,
+    if (result.handled && result.codexPrompt) {
+      await sendToCodex(
+        result.codexPrompt, imageItem, fileItem, fromUserId, contextToken,
         account, session, sessionStore, sender, config, activeControllers,
       );
       return;
@@ -416,14 +421,14 @@ async function handleMessage(
     // Not handled, treat as normal message (fall through)
   }
 
-  // -- Normal message -> Claude --
+  // -- Normal message -> Codex --
 
   if (!userText && !imageItem && !fileItem) {
     await sender.sendText(fromUserId, contextToken, '暂不支持此类型消息，请发送文字、语音、图片或文件');
     return;
   }
 
-  await sendToClaude(
+  await sendToCodex(
     userText, imageItem, fileItem, fromUserId, contextToken,
     account, session, sessionStore, sender, config, activeControllers,
   );
@@ -478,7 +483,7 @@ async function flushPending(
   }
 }
 
-async function sendToClaude(
+async function sendToCodex(
   userText: string,
   imageItem: ReturnType<typeof extractFirstImageUrl>,
   fileItem: ReturnType<typeof extractFirstFileItem>,
@@ -509,10 +514,12 @@ async function sendToClaude(
   const stopTyping = sender.startTyping(fromUserId, contextToken);
 
   try {
+    config = loadConfig();
     // Download image if present
     let images: QueryOptions['images'];
     if (imageItem) {
       const base64DataUri = await downloadImage(imageItem);
+      if (!base64DataUri) throw new Error('图片下载失败');
       if (base64DataUri) {
         const matches = base64DataUri.match(/^data:([^;]+);base64,(.+)$/);
         if (matches) {
@@ -534,6 +541,7 @@ async function sendToClaude(
     let prompt = userText || '请分析这张图片';
     if (fileItem) {
       const filePath = await downloadFile(fileItem);
+      if (!filePath) throw new Error('文件下载失败');
       if (filePath) {
         const fileName = fileItem.file_item?.file_name || basename(filePath);
         prompt = userText
@@ -550,7 +558,7 @@ async function sendToClaude(
     let flushChain: Promise<void> = Promise.resolve();
 
     function emitText(text: string, role: 'interstitial' | 'final'): void {
-      if (!text.trim()) return;
+      if (abortController.signal.aborted || !text.trim()) return;
 
       // 若上一次发送失败留下了 pendingRetry，先用它原本的 role 单独补发，
       // 不要和当前 role 的文本合并（避免 interstitial 内容混进 final 答案）。
@@ -564,8 +572,9 @@ async function sendToClaude(
     }
 
     function scheduleSend(text: string, role: 'interstitial' | 'final'): void {
-      if (!text.trim()) return;
+      if (abortController.signal.aborted || !text.trim()) return;
       flushChain = flushChain.then(async () => {
+        if (abortController.signal.aborted) return;
         const chunks = splitMessage(text);
         for (let i = 0; i < chunks.length; i++) {
           try {
@@ -589,20 +598,9 @@ async function sendToClaude(
 
     // Safety net: send keepalive if nothing was sent for 5 minutes
     const SILENCE_WARNING_MS = 5 * 60 * 1000;
-    const SILENCE_MESSAGES = [
-      '我还在处理中，这个问题有点复杂，请再稍等一下',
-      '正在努力干活中，马上就有结果了，请稍等片刻',
-      '有点复杂正在处理，再给我一点时间，很快就好',
-      '快好了别着急，正在收尾阶段，马上给你回复',
-      '还在跑呢，任务量比较大，不过马上就能出结果了',
-      '任务比想象的复杂一些，再等等我，正在全力处理',
-      '正在处理中，进展顺利，再等一会儿就好',
-      '还没完不过已经快了，再给我一分钟就能搞定',
-      '我在认真思考这个问题，请再稍等一会儿',
-      '稍微有点棘手，不过已经快解决了，再等我一下',
-    ];
+    const SILENCE_MESSAGES = ['Codex 仍在处理，暂未返回新的结果。可发送 /stop 停止任务。'];
     flushTimer = setInterval(() => {
-      if (Date.now() - lastSentTime > SILENCE_WARNING_MS) {
+      if (!abortController.signal.aborted && Date.now() - lastSentTime > SILENCE_WARNING_MS) {
         const msg = SILENCE_MESSAGES[Math.floor(Math.random() * SILENCE_MESSAGES.length)];
         sender.sendText(fromUserId, contextToken, msg).catch(() => {});
         lastSentTime = Date.now();
@@ -613,9 +611,12 @@ async function sendToClaude(
       prompt,
       cwd: (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir()),
       resume: session.sdkSessionId,
-      model: session.model,
+      model: session.model || config.model,
+      codexPath: config.codexPath,
+      sandbox: config.sandbox,
+      timeoutMs: config.timeoutMs,
       systemPrompt: [
-        '你正在通过微信与用户对话，不是在终端里。不要让用户去终端操作。如果用户需要文件，直接输出文件地址就行，会自动识别解析推送文件到用户的微信中。',
+        '你正在通过微信与用户对话，请用清晰简洁的语言回复。需要发送文件时，在回复中提供本地文件的绝对路径。只发送用户请求的相关文件。',
         config.systemPrompt,
       ].filter(Boolean).join('\n'),
       abortController,
@@ -628,17 +629,9 @@ async function sendToClaude(
       },
     };
 
-    let result = await claudeQuery(queryOptions);
-
-    // If resume failed (e.g. corrupted session), retry without resume
-    if (result.error && queryOptions.resume) {
-      logger.warn('Resume failed, retrying without resume', { error: result.error, sessionId: queryOptions.resume });
-      queryOptions.resume = undefined;
-      session.sdkSessionId = undefined;
-      sessionStore.save(account.accountId, session);
-      const retryResult = await claudeQuery(queryOptions);
-      Object.assign(result, retryResult);
-    }
+    const result = await codexQuery(queryOptions);
+    if (result.sessionId) session.sdkSessionId = result.sessionId;
+    if (result.aborted || abortController.signal.aborted) { await flushChain; return; }
 
     // Stop periodic flush, drain router (final 先于 interstitial), wait for queued sends
     clearInterval(flushTimer);
@@ -649,7 +642,7 @@ async function sendToClaude(
     // 这里做有上限的终态重试，避免静默丢内容（commit d6d7d62 的 "never silently drop" 保证）。
     const MAX_TERMINAL_ATTEMPTS = 3;
     let terminalAttempt = 0;
-    while (pendingRetry && terminalAttempt < MAX_TERMINAL_ATTEMPTS) {
+    while (pendingRetry && !abortController.signal.aborted && terminalAttempt < MAX_TERMINAL_ATTEMPTS) {
       const stuck: { text: string; role: 'interstitial' | 'final' } = pendingRetry;
       pendingRetry = null;
       terminalAttempt++;
@@ -660,6 +653,7 @@ async function sendToClaude(
         textLength: stuck.text.length,
       });
       await new Promise(r => setTimeout(r, delayMs));
+      if (abortController.signal.aborted) return;
 
       const chunks = splitMessage(stuck.text);
       let failed = false;
@@ -703,11 +697,11 @@ async function sendToClaude(
       pendingRetry = null;
     }
 
+    if (abortController.signal.aborted) return;
+
     // Send result back to WeChat
     if (result.text) {
-      if (result.error) {
-        logger.warn('Claude query had error but returned text, using text', { error: result.error });
-      }
+
       sessionStore.addChatMessage(session, 'assistant', result.text);
       // If nothing was streamed at all (e.g. streaming not supported), send full text now
       if (!anySent) {
@@ -716,31 +710,33 @@ async function sendToClaude(
           await sender.sendText(fromUserId, contextToken, chunk);
         }
       }
-    } else if (result.error) {
-      logger.error('Claude query error', { error: result.error });
-      await sender.sendText(fromUserId, contextToken, 'Claude 处理请求时出错，请稍后重试。');
-    } else if (!anySent) {
-      await sender.sendText(fromUserId, contextToken, 'Claude 无返回内容（可能因权限被拒而终止）');
+    }
+    if (result.error) {
+      logger.error('Codex query error', { error: result.error });
+      await sender.sendText(fromUserId, contextToken, formatCodexError(result.error));
+    } else if (!result.text && !anySent) {
+      await sender.sendText(fromUserId, contextToken, 'Codex 无返回内容（可能因权限被拒而终止）');
     }
 
     // Update session with new SDK session ID
-    session.sdkSessionId = result.sessionId || undefined;
+    session.sdkSessionId = result.sessionId || session.sdkSessionId;
     session.state = 'idle';
     sessionStore.save(account.accountId, session);
 
-    // Auto-push deliverable files mentioned in Claude's response
-    if (result.text) {
+    // Auto-push deliverable files mentioned in Codex's response
+    if (result.text && !result.error) {
       const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
       const detectedPaths = extractFilePathsFromText(result.text, cwd);
       const { existsSync } = await import('node:fs');
       const { extname } = await import('node:path');
-      const pushable = detectedPaths.filter(f => {
+      const pushable = [...new Set(detectedPaths)].filter(f => {
         const ext = extname(f).toLowerCase();
         return AUTO_PUSH_EXTENSIONS.has(ext) && existsSync(f);
       });
       if (pushable.length > 0) {
         const failedFiles: string[] = [];
         for (const filePath of pushable) {
+          if (abortController.signal.aborted) return;
           try {
             await sender.sendFile(fromUserId, contextToken, filePath);
           } catch {
@@ -753,6 +749,7 @@ async function sendToClaude(
             const delay = (attempt + 1) * 15_000;
             logger.warn(`Rate-limited, retrying ${failedFiles.length} file(s) in ${delay / 1000}s (attempt ${attempt + 1}/3)`);
             await new Promise(r => setTimeout(r, delay));
+            if (abortController.signal.aborted) return;
             const stillFailed: string[] = [];
             for (const filePath of failedFiles) {
               try {
@@ -776,15 +773,17 @@ async function sendToClaude(
     const isAbort = err instanceof Error && (err.name === 'AbortError' || err.message.includes('abort'));
     if (isAbort) {
       // Query was cancelled by a new incoming message — exit silently
-      logger.info('Claude query aborted by new message');
+      logger.info('Codex query aborted by new message');
     } else {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      logger.error('Error in sendToClaude', { error: errorMsg });
+      logger.error('Error in sendToCodex', { error: errorMsg });
       await sender.sendText(fromUserId, contextToken, '处理消息时出错，请稍后重试。');
     }
     session.state = 'idle';
     sessionStore.save(account.accountId, session);
   } finally {
+    session.state = 'idle';
+    sessionStore.save(account.accountId, session);
     clearInterval(flushTimer);
     stopTyping();
     // Clean up the abort controller if it's still ours
@@ -798,19 +797,23 @@ async function sendToClaude(
 // CLI
 // ---------------------------------------------------------------------------
 
-const command = process.argv[2];
+function checkCodex(config: ReturnType<typeof loadConfig>): void {
+  const binary = config.codexPath || process.env.CODEX_BIN || 'codex';
+  const result = spawnSync(binary, ['--version'], { encoding: 'utf8', timeout: 10_000 });
+  if (result.error || result.status !== 0) {
+    throw new Error(`无法运行 Codex (${binary})。请安装 @openai/codex 并执行 codex login，或配置 codexPath。`);
+  }
+  logger.info('Codex runtime ready', { codexPath: binary, version: result.stdout.trim() });
+}
 
-if (command === 'setup') {
-  runSetup().catch((err) => {
-    logger.error('Setup failed', { error: err instanceof Error ? err.message : String(err) });
-    console.error('设置失败:', err);
-    process.exit(1);
-  });
+const command = process.argv[2];
+if (command === '--help' || command === 'help' || command === '-h') {
+  console.log('WeChat Codex Bridge\n用法: node dist/main.js [setup|start|help]\nsetup: 扫码绑定微信；start: 前台启动；npm run daemon -- start: 后台启动');
+} else if (command === 'setup') {
+  runSetup().catch((err) => { console.error('设置失败:', err.message); process.exitCode = 1; });
+} else if (!command || command === 'start') {
+  runDaemon().catch((err) => { console.error('启动失败:', err.message); process.exitCode = 1; });
 } else {
-  // 'start' or no argument
-  runDaemon().catch((err) => {
-    logger.error('Daemon start failed', { error: err instanceof Error ? err.message : String(err) });
-    console.error('启动失败:', err);
-    process.exit(1);
-  });
+  console.error(`未知命令: ${command}，请使用 --help`);
+  process.exitCode = 1;
 }

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TurnRouter, type RoutedMessage } from '../claude/turn-router.js';
+import { TurnRouter, type RoutedMessage } from '../codex/turn-router.js';
 
 function newRouter() {
   const emitted: RoutedMessage[] = [];

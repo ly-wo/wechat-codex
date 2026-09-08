@@ -1,7 +1,7 @@
 {
-  "name": "wechat-claude-code",
-  "version": "1.0.0",
-  "description": "Chat with Claude Code from WeChat - a Claude Code Skill that bridges personal WeChat to local Claude Code",
+  "name": "wechat-codex",
+  "version": "1.0.0-codex.1",
+  "description": "WeChat bridge for local Codex CLI, adapted from Wechat-ggGitHub/wechat-claude-code",
   "type": "module",
   "scripts": {
     "build": "tsc",
@@ -9,13 +9,14 @@
     "start": "node dist/main.js",
     "run": "node dist/main.js start",
     "dev": "tsc --watch",
-    "test": "node --test dist/tests/*.test.js",
+    "test": "node scripts/test.mjs",
     "setup": "node dist/main.js setup",
     "daemon": "bash scripts/daemon.sh",
-    "visualize": "npx tsx src/tools/visualize-logs.ts"
+    "visualize": "npx tsx src/tools/visualize-logs.ts",
+    "check": "npm run build && npm test"
   },
   "dependencies": {
-"qrcode": "^1.5.4",
+    "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0"
   },
   "devDependencies": {
@@ -24,11 +25,20 @@
     "@types/qrcode-terminal": "^0.12.0",
     "typescript": "^5.7.0"
   },
-  "keywords": ["wechat", "claude-code", "claude", "bridge", "chat", "skill"],
+  "keywords": [
+    "wechat",
+    "codex",
+    "bridge",
+    "chat",
+    "skill"
+  ],
   "author": "Wechat-ggGitHub",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Wechat-ggGitHub/wechat-claude-code.git"
+    "url": "https://github.com/ly-wo/wechat-codex.git"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

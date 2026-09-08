@@ -1,5 +1,6 @@
+import { DATA_DIR } from '../constants.js';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+
 import { readdirSync, statSync } from 'node:fs';
 import { loadJson, saveJson, validateAccountId } from '../store.js';
 import { logger } from '../logger.js';
@@ -14,7 +15,7 @@ export interface AccountData {
   createdAt: string;
 }
 
-const ACCOUNTS_DIR = join(homedir(), '.wechat-claude-code', 'accounts');
+const ACCOUNTS_DIR = join(DATA_DIR, 'accounts');
 
 function accountPath(accountId: string): string {
   validateAccountId(accountId);

@@ -2,13 +2,26 @@
 set -euo pipefail
 
 # =============================================================================
-# wechat-claude-code cross-platform daemon manager
+# wechat-codex cross-platform daemon manager
 # Supports: macOS (launchd) / Linux (systemd + nohup fallback)
 # =============================================================================
 
-DATA_DIR="${HOME}/.wechat-claude-code"
+DATA_DIR="${WECHAT_CODEX_DATA_DIR:-${WCC_DATA_DIR:-${HOME}/.wechat-codex}}"
+export WECHAT_CODEX_DATA_DIR="$DATA_DIR"
+export CODEX_BIN="${CODEX_BIN:-$(command -v codex 2>/dev/null || true)}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SERVICE_NAME="wechat-claude-code"
+SERVICE_NAME="wechat-codex"
+
+# Escape values before embedding them in launchd XML or systemd unit files.
+xml_escape() {
+  node -e 'process.stdout.write(process.argv[1].replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"))' "$1"
+}
+unit_quote() {
+  node -e 'process.stdout.write(JSON.stringify(process.argv[1].replace(/%/g,"%%")))' "$1"
+}
+exec_quote() {
+  unit_quote "${1//\$/\$\$}"
+}
 
 # Platform detection
 OS_TYPE="$(uname -s)"
@@ -18,7 +31,7 @@ OS_TYPE="$(uname -s)"
 # =============================================================================
 
 macos_plist_label() {
-  echo "com.wechat-claude-code.bridge"
+  echo "com.wechat-codex.bridge"
 }
 
 macos_plist_path() {
@@ -39,14 +52,14 @@ macos_start() {
     exit 0
   fi
 
-  mkdir -p "$DATA_DIR/logs"
+  mkdir -p "$DATA_DIR/logs" "$(dirname "$plist_path")"
 
-  # Collect Anthropic/Claude env vars for plist
+  # Collect Codex env vars for plist
   local plist_extra_env=""
-  for var in ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_API_KEY; do
+  for var in CODEX_HOME CODEX_BIN WECHAT_CODEX_DATA_DIR OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY; do
     if [ -n "${!var:-}" ]; then
       plist_extra_env="${plist_extra_env}    <key>${var}</key>
-    <string>${!var}</string>
+    <string>$(xml_escape "${!var}")</string>
 "
     fi
   done
@@ -60,31 +73,32 @@ macos_start() {
   <string>${plist_label}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${node_bin}</string>
-    <string>${PROJECT_DIR}/dist/main.js</string>
+    <string>$(xml_escape "${node_bin}")</string>
+    <string>$(xml_escape "${PROJECT_DIR}/dist/main.js")</string>
     <string>start</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>${PROJECT_DIR}</string>
+  <string>$(xml_escape "${PROJECT_DIR}")</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${DATA_DIR}/logs/stdout.log</string>
+  <string>$(xml_escape "${DATA_DIR}/logs/stdout.log")</string>
   <key>StandardErrorPath</key>
-  <string>${DATA_DIR}/logs/stderr.log</string>
+  <string>$(xml_escape "${DATA_DIR}/logs/stderr.log")</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${HOME}/.local/bin:${node_bin%/*}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <string>$(xml_escape "$PATH")</string>
 ${plist_extra_env}  </dict>
 </dict>
 </plist>
 PLIST
 
-  launchctl load "$plist_path"
-  echo "Started wechat-claude-code daemon (macOS launchd)"
+  chmod 600 "$plist_path"
+  launchctl bootstrap "gui/$(id -u)" "$plist_path"
+  echo "Started wechat-codex daemon (macOS launchd)"
 }
 
 macos_stop() {
@@ -93,7 +107,7 @@ macos_stop() {
 
   launchctl bootout "gui/$(id -u)/${plist_label}" 2>/dev/null || true
   rm -f "$plist_path"
-  echo "Stopped wechat-claude-code daemon (macOS launchd)"
+  echo "Stopped wechat-codex daemon (macOS launchd)"
 }
 
 macos_status() {
@@ -173,30 +187,29 @@ linux_create_service_file() {
 
   mkdir -p "$(dirname "$service_file")"
 
-  # Collect Anthropic/Claude env vars to pass through to the service
+  # Collect Codex env vars to pass through to the service
   local extra_env=""
-  for var in ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_API_KEY; do
+  for var in CODEX_HOME CODEX_BIN WECHAT_CODEX_DATA_DIR OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY; do
     if [ -n "${!var:-}" ]; then
-      extra_env="${extra_env}Environment=${var}=${!var}
+      extra_env="${extra_env}Environment=$(unit_quote "${var}=${!var}")
 "
     fi
   done
 
   cat > "$service_file" <<SERVICE
 [Unit]
-Description=WeChat Claude Code Bridge
-Documentation=https://github.com/Wechat-ggGitHub/wechat-claude-code
+Description=WeChat Codex Bridge
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=${node_bin} ${PROJECT_DIR}/dist/main.js start
-WorkingDirectory=${PROJECT_DIR}
+ExecStart=$(exec_quote "$node_bin") $(exec_quote "${PROJECT_DIR}/dist/main.js") start
+WorkingDirectory=$(unit_quote "$PROJECT_DIR")
 Restart=always
 RestartSec=10
-Environment=PATH=${HOME}/.local/bin:${node_bin%/*}:/usr/local/bin:/usr/bin:/bin
-${extra_env}StandardOutput=append:${DATA_DIR}/logs/stdout.log
-StandardError=append:${DATA_DIR}/logs/stderr.log
+Environment=$(unit_quote "PATH=$PATH")
+${extra_env}StandardOutput=$(unit_quote "append:${DATA_DIR}/logs/stdout.log")
+StandardError=$(unit_quote "append:${DATA_DIR}/logs/stderr.log")
 NoNewPrivileges=true
 PrivateTmp=true
 
@@ -204,7 +217,7 @@ PrivateTmp=true
 WantedBy=default.target
 SERVICE
 
-  chmod 644 "$service_file"
+  chmod 600 "$service_file"
 }
 
 linux_reload_daemon() {
@@ -227,7 +240,7 @@ linux_direct_start() {
 
   mkdir -p "$DATA_DIR/logs"
 
-  echo "Starting wechat-claude-code daemon (direct mode)..."
+  echo "Starting wechat-codex daemon (direct mode)..."
   nohup "$node_bin" "${PROJECT_DIR}/dist/main.js" start \
     >> "$DATA_DIR/logs/stdout.log" \
     2>> "$DATA_DIR/logs/stderr.log" &
@@ -304,7 +317,7 @@ linux_start() {
 
     systemctl --user start "${SERVICE_NAME}"
     systemctl --user enable "${SERVICE_NAME}" 2>/dev/null || true
-    echo "Started wechat-claude-code daemon (Linux systemd)"
+    echo "Started wechat-codex daemon (Linux systemd)"
   else
     echo "Note: systemd user session not available, using direct mode"
     echo "To enable systemd mode, run: 'loginctl enable-linger $(whoami)'"
@@ -317,7 +330,7 @@ linux_stop() {
   if linux_systemd_available && systemctl --user cat "${SERVICE_NAME}" &>/dev/null; then
     systemctl --user stop "${SERVICE_NAME}" 2>/dev/null || true
     systemctl --user disable "${SERVICE_NAME}" 2>/dev/null || true
-    echo "Stopped wechat-claude-code daemon (Linux systemd)"
+    echo "Stopped wechat-codex daemon (Linux systemd)"
   else
     linux_direct_stop
   fi

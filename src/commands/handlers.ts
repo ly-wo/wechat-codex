@@ -1,5 +1,5 @@
 import type { CommandContext, CommandResult } from './router.js';
-import { scanAllSkills, formatSkillList, findSkill, type SkillInfo } from '../claude/skill-scanner.js';
+import { scanAllSkills, findSkill, type SkillInfo } from '../codex/skill-scanner.js';
 import { loadConfig, saveConfig } from '../config.js';
 import { DEFAULT_WORKING_DIR } from '../constants.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
@@ -15,16 +15,16 @@ const HELP_TEXT = `可用命令：
   /clear            清除当前会话
   /reset            完全重置（包括工作目录等设置）
   /status           查看当前会话状态
-  /compact          压缩上下文（开始新 SDK 会话，保留历史）
+  /compact          开启新上下文（只保留本地历史记录）
   /history [数量]   查看对话记录（默认最近20条）
-  /undo [数量]      撤销最近对话（默认1条）
+  /undo [数量]      删除本地历史（不回滚代码或 Codex 上下文）
 
 文件：
   /send <路径>      发送本地文件（图片直接显示，其他文件作为附件）
 
 配置：
   /cwd [路径]       查看或切换工作目录
-  /model [名称]     查看或切换 Claude 模型
+  /model [名称]     查看或切换 Codex 模型
   /prompt [内容]    查看或设置系统提示词（全局生效）
 
 其他：
@@ -32,17 +32,19 @@ const HELP_TEXT = `可用命令：
   /version          查看版本信息
   /<skill> [参数]   触发已安装的 skill
 
-直接输入文字即可与 Claude Code 对话`;
+直接输入文字即可与 Codex 对话`;
 
 // 缓存 skill 列表，避免每次命令都扫描文件系统
 let cachedSkills: SkillInfo[] | null = null;
 let lastScanTime = 0;
+let cachedCwd = '';
 const CACHE_TTL = 60_000; // 60秒
 
-function getSkills(): SkillInfo[] {
+function getSkills(cwd: string): SkillInfo[] {
   const now = Date.now();
-  if (!cachedSkills || now - lastScanTime > CACHE_TTL) {
-    cachedSkills = scanAllSkills();
+  if (!cachedSkills || cachedCwd !== cwd || now - lastScanTime > CACHE_TTL) {
+    cachedSkills = scanAllSkills(cwd);
+    cachedCwd = cwd;
     lastScanTime = now;
   }
   return cachedSkills;
@@ -59,7 +61,7 @@ export function handleHelp(_args: string): CommandResult {
 
 export function handleClear(ctx: CommandContext): CommandResult {
   const newSession = ctx.clearSession();
-  Object.assign(ctx.session, newSession);
+  ctx.updateSession(newSession);
   return { reply: '✅ 会话已清除，下次消息将开始新会话。', handled: true };
 }
 
@@ -67,15 +69,19 @@ export function handleCwd(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
     return { reply: `当前工作目录: ${ctx.session.workingDirectory}\n用法: /cwd <路径>`, handled: true };
   }
-  ctx.updateSession({ workingDirectory: args });
-  return { reply: `✅ 工作目录已切换为: ${args}`, handled: true };
+  const path = resolve(ctx.session.workingDirectory, args.replace(/^~(?=\/|$)/, homedir()));
+  try {
+    if (!statSync(path).isDirectory()) throw new Error('not a directory');
+  } catch { return { reply: `目录不存在或无法访问: ${path}`, handled: true }; }
+  ctx.updateSession({ workingDirectory: path, sdkSessionId: undefined, previousSdkSessionId: undefined });
+  return { reply: `✅ 工作目录已切换为: ${path}\n下次消息将开始新会话。`, handled: true };
 }
 
 export function handleModel(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
-    return { reply: '用法: /model <模型名称>\n例: /model claude-sonnet-4-6', handled: true };
+    return { reply: `当前模型: ${ctx.session.model || loadConfig().model || 'Codex 默认'}\n用法: /model <模型名称>；/model default 恢复默认`, handled: true };
   }
-  ctx.updateSession({ model: args });
+  ctx.updateSession({ model: args === 'default' ? undefined : args });
   return { reply: `✅ 模型已切换为: ${args}`, handled: true };
 }
 
@@ -85,16 +91,16 @@ export function handleStatus(ctx: CommandContext): CommandResult {
     '📊 会话状态',
     '',
     `工作目录: ${s.workingDirectory}`,
-    `模型: ${s.model ?? '默认'}`,
+    `模型: ${s.model || loadConfig().model || 'Codex 默认'}`,
     `会话ID: ${s.sdkSessionId ?? '无'}`,
     `状态: ${s.state}`,
   ];
   return { reply: lines.join('\n'), handled: true };
 }
 
-export function handleSkills(args: string): CommandResult {
+export function handleSkills(args: string, ctx: CommandContext): CommandResult {
   invalidateSkillCache();
-  const skills = getSkills();
+  const skills = getSkills(ctx.session.workingDirectory);
   if (skills.length === 0) {
     return { reply: '未找到已安装的 skill。', handled: true };
   }
@@ -125,23 +131,24 @@ export function handleHistory(ctx: CommandContext, args: string): CommandResult 
 /** 完全重置会话（包括工作目录等设置） */
 export function handleReset(ctx: CommandContext): CommandResult {
   const newSession = ctx.clearSession();
-  newSession.workingDirectory = DEFAULT_WORKING_DIR;
-  Object.assign(ctx.session, newSession);
-  return { reply: '✅ 会话已完全重置，所有设置恢复默认。', handled: true };
+  newSession.workingDirectory = loadConfig().workingDirectory;
+  newSession.model = undefined;
+  ctx.updateSession(newSession);
+  return { reply: '✅ 会话已重置，工作目录和模型恢复全局配置。', handled: true };
 }
 
-/** 压缩上下文 — 清除 SDK 会话 ID，开始新上下文但保留聊天历史 */
+/** 压缩上下文 — 清除 Codex 会话 ID，开始新上下文但保留聊天历史 */
 export function handleCompact(ctx: CommandContext): CommandResult {
   const currentSessionId = ctx.session.sdkSessionId;
   if (!currentSessionId) {
-    return { reply: 'ℹ️ 当前没有活动的 SDK 会话，无需压缩。', handled: true };
+    return { reply: 'ℹ️ 当前没有活动的 Codex 会话，无需压缩。', handled: true };
   }
   ctx.updateSession({
     previousSdkSessionId: currentSessionId,
     sdkSessionId: undefined,
   });
   return {
-    reply: '✅ 上下文已压缩\n\n下次消息将开始新的 SDK 会话（token 清零）\n聊天历史已保留，可用 /history 查看',
+    reply: '✅ 下次消息将开始新的 Codex 上下文。\n本地聊天记录仍可用 /history 查看，但不会自动带入新上下文。',
     handled: true,
   };
 }
@@ -159,7 +166,7 @@ export function handleUndo(ctx: CommandContext, args: string): CommandResult {
   const actualCount = Math.min(count, history.length);
   ctx.session.chatHistory = history.slice(0, -actualCount);
   ctx.updateSession({ chatHistory: ctx.session.chatHistory });
-  return { reply: `✅ 已撤销最近 ${actualCount} 条对话`, handled: true };
+  return { reply: `✅ 已删除最近 ${actualCount} 条本地记录。Codex 上下文和已修改的文件保持原状。`, handled: true };
 }
 
 /** 查看版本信息 */
@@ -168,9 +175,9 @@ export function handleVersion(): CommandResult {
     const __dirname = fileURLToPath(new URL('.', import.meta.url));
     const pkg = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf-8'));
     const version = pkg.version || 'unknown';
-    return { reply: `wechat-claude-code v${version}`, handled: true };
+    return { reply: `wechat-codex v${version}`, handled: true };
   } catch {
-    return { reply: 'wechat-claude-code (version unknown)', handled: true };
+    return { reply: 'wechat-codex (version unknown)', handled: true };
   }
 }
 
@@ -217,13 +224,13 @@ export function handleSend(ctx: CommandContext, args: string): CommandResult {
   return { handled: true, sendFile: resolved };
 }
 
-export function handleUnknown(cmd: string, args: string): CommandResult {
-  const skills = getSkills();
+export function handleUnknown(cmd: string, args: string, ctx: CommandContext): CommandResult {
+  const skills = getSkills(ctx.session.workingDirectory);
   const skill = findSkill(skills, cmd);
 
   if (skill) {
-    const prompt = args ? `Use the ${skill.name} skill: ${args}` : `Use the ${skill.name} skill`;
-    return { handled: true, claudePrompt: prompt };
+    const prompt = `Use the $${skill.name} skill. Read its instructions at ${join(skill.path, 'SKILL.md')} first.\n${args}`;
+    return { handled: true, codexPrompt: prompt };
   }
 
   return {
